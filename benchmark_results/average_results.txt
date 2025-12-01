@@ -1,0 +1,17 @@
+=======================================
+ Benchmark summary for ./optimized_final
+ Runs: 5
+ Input: romania.mov
+=======================================
+Average Wall Time:     7.936000 seconds
+
+Greyscale Averages:
+  Cycles:              10348
+  L1 Cache Miss:       38
+  L2 Cache Miss:       134
+
+Sobel Averages:
+  Cycles:              10222
+  L1 Cache Miss:       36
+  L2 Cache Miss:       106
+=======================================

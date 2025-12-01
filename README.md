@@ -1,2 +1,0 @@
-# CPE442_2025_FALL_Tutorial_6_Final_Project
-# CPE442_2025_FALL_Tutorial_6_Final_Project
