@@ -43,23 +43,11 @@ struct WorkerContext {
     int tid = 0; 
 };
 
-//Calculates the magnitude of GX and GY
-static inline void magnitude(const cv::Mat& gx32f, const cv::Mat& gy32f, cv::Mat& mag32f, int yStart, int yEnd){
-    const int rows = gx32f.rows,  cols = gx32f.cols;
-    const int ys = std::max(0, yStart); // Starting row, max to prevent clipping
-    const int ye = std::min(rows, yEnd); // Ending row, min to prevent clipping
+/* New function that calculates X, Y , Mag in 1 go. 
+   We can still speed this up. 
+   1. Vectorize 
+   2. Write an algorithmn that reuse prev, curr, next. They load duplicate data.*/
 
-    for(int y = ys; y < ye; ++y){
-        const float* gX_row = gx32f.ptr<float>(y);
-        const float* gY_row = gy32f.ptr<float>(y); 
-        float* out = mag32f.ptr<float>(y); 
-        for (int x = 0; x < cols; ++x) {
-            out[x] = sqrt(gX_row[x] * gX_row[x] + gY_row[x] * gY_row[x]);
-        }
-    }
-}
-
-// New function that calculates X, Y , Mag in 1 go. 
 void sobel_calculation(const cv::Mat& gray, cv::Mat& mag32f, int yStart, int yEnd){
     const int border = 1; 
     const int rows = gray.rows, cols = gray.cols; 
@@ -70,30 +58,37 @@ void sobel_calculation(const cv::Mat& gray, cv::Mat& mag32f, int yStart, int yEn
 
     // Iterating the columns
     for (int y = ys; y < ye; ++y) {
+
+        // Loading the previous, current, and next row for convolution
         const uchar* prev = gray.ptr<uchar>(y - 1);
         const uchar* curr = gray.ptr<uchar>(y);
         const uchar* next = gray.ptr<uchar>(y + 1);
+
+        // Store pointer to output row
         float* out = mag32f.ptr<float>(y);
         
-        // Iterating the rows 
+        // Iterating the rows in each column
         for (int x = border; x < cols - border; ++x) {
-            // Sobel X
+            // Sobel X applied to current (x,y)
             float gx =
                 prev[x-1]*X_KERNEL[0] + prev[x]*X_KERNEL[1] + prev[x+1]*X_KERNEL[2] +
                 curr[x-1]*X_KERNEL[3] + curr[x]*X_KERNEL[4] + curr[x+1]*X_KERNEL[5] +
                 next[x-1]*X_KERNEL[6] + next[x]*X_KERNEL[7] + next[x+1]*X_KERNEL[8];
 
-            // Sobel Y
+            // Sobel Y applied to current (x,y)
             float gy =
                 prev[x-1]*Y_KERNEL[0] + prev[x]*Y_KERNEL[1] + prev[x+1]*Y_KERNEL[2] +
                 curr[x-1]*Y_KERNEL[3] + curr[x]*Y_KERNEL[4] + curr[x+1]*Y_KERNEL[5] +
                 next[x-1]*Y_KERNEL[6] + next[x]*Y_KERNEL[7] + next[x+1]*Y_KERNEL[8];
-
+            
+            // Magnitude Calculation for current (x,y)
             out[x] = std::sqrt(gx*gx + gy*gy);
         }
     }
 };
 
+
+/* Can't really reduce cache misses with the grayscale because we aren't reusing any data*/
 static inline __attribute__((noinline)) void grayscale_calculation(const cv::Mat& bgr, cv::Mat& gray,int yStart, int yEnd){
     const int rows = bgr.rows, cols = bgr.cols;
     const int ys = std::max(0, yStart);
