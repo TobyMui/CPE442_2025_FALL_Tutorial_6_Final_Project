@@ -15,18 +15,16 @@ using namespace std::chrono;
 const int NUM_THREADS = 4; //Num Threads
 
 // Sobel Filter Kernel
-static int16_t X_KERNEL[9] = { -1,0,1, -2,0,2, -1,0,1 };
-static int16_t Y_KERNEL[9] = { -1,-2,-1, 0,0,0, 1,2,1 };
+static int16_t SOBEL_X_KERNEL[9] = { -1,0,1, -2,0,2, -1,0,1 };
+static int16_t SOBEL_Y_KERNEL[9] = { -1,-2,-1, 0,0,0, 1,2,1 };
 
 // All great things start with an FSM 
-enum class ComputeStages: int {GRAY_SCALE = 0, SOBEL_MAG = 1, STOP = 2}; 
+enum class ComputeStages: int {GRAY_SCALE = 0, SOBEL_XY = 1, MAGNITUDE = 2, STOP = 3}; 
 
 // Shared data between main thread and worker threads
 struct FrameJob {
     const cv::Mat* bgrFrame = nullptr; 
     cv::Mat* grayFrame = nullptr; 
-
-    // Goal is to get rid of the need for sobleXOut and sobelYOut. We can calculate both at the same time then compute magnitude there. 
     cv::Mat* sobelXOut = nullptr; 
     cv::Mat* sobelYOut = nullptr; 
     cv::Mat* mag32fOut = nullptr; 
@@ -43,128 +41,109 @@ struct WorkerContext {
     int tid = 0; 
 };
 
-/* New function that calculates X, Y , Mag in 1 go. 
-   We can still speed this up. 
-   1. Vectorize 
-   2. Write an algorithmn that reuse prev, curr, next. They load duplicate data.*/
+//Calculates the magnitude of GX and GY
+static inline void magnitude(const cv::Mat& gx32f, const cv::Mat& gy32f, cv::Mat& mag32f, int yStart, int yEnd){
+    const int rows = gx32f.rows,  cols = gx32f.cols;
+    const int ys = std::max(0, yStart); // Starting row, max to prevent clipping
+    const int ye = std::min(rows, yEnd); // Ending row, min to prevent clipping
 
-void sobel_calculation(const cv::Mat& gray, cv::Mat& mag32f, int yStart, int yEnd){
-    const int border = 1; 
-    const int rows = gray.rows, cols = gray.cols; 
-
-    // Bounds checking
-    const int ys = std::max(border, yStart); 
-    const int ye = std::min(rows - border, yEnd); 
-
-    // Iterating the columns
-    for (int y = ys; y < ye; ++y) {
-
-        // Loading the previous, current, and next row for convolution
-        const uchar* prev = gray.ptr<uchar>(y - 1);
-        const uchar* curr = gray.ptr<uchar>(y);
-        const uchar* next = gray.ptr<uchar>(y + 1);
-
-        // Store pointer to output row
-        float* out = mag32f.ptr<float>(y);
-        
-        // Iterating the rows in each column
-        for (int x = border; x < cols - border; ++x) {
-            // Sobel X applied to current (x,y)
-            float gx =
-                prev[x-1]*X_KERNEL[0] + prev[x]*X_KERNEL[1] + prev[x+1]*X_KERNEL[2] +
-                curr[x-1]*X_KERNEL[3] + curr[x]*X_KERNEL[4] + curr[x+1]*X_KERNEL[5] +
-                next[x-1]*X_KERNEL[6] + next[x]*X_KERNEL[7] + next[x+1]*X_KERNEL[8];
-
-            // Sobel Y applied to current (x,y)
-            float gy =
-                prev[x-1]*Y_KERNEL[0] + prev[x]*Y_KERNEL[1] + prev[x+1]*Y_KERNEL[2] +
-                curr[x-1]*Y_KERNEL[3] + curr[x]*Y_KERNEL[4] + curr[x+1]*Y_KERNEL[5] +
-                next[x-1]*Y_KERNEL[6] + next[x]*Y_KERNEL[7] + next[x+1]*Y_KERNEL[8];
-            
-            // Magnitude Calculation for current (x,y)
-            out[x] = std::sqrt(gx*gx + gy*gy);
-        }
-    }
-};
-
-void sobel_calculation_neon(const cv::Mat& gray, cv::Mat& mag32f, int yStart, int yEnd){
-    const int border = 1; 
-    const int rows = gray.rows, cols = gray.cols; 
-    const int ys = std::max(border, yStart); 
-    const int ye = std::min(rows - border, yEnd); 
-
-    for (int y = ys; y < ye; ++y) {
-        const uchar* prev = gray.ptr<uchar>(y - 1);
-        const uchar* curr = gray.ptr<uchar>(y);
-        const uchar* next = gray.ptr<uchar>(y + 1);
-        float* out = mag32f.ptr<float>(y);
-        
-        int x = border;
-        
-        // Process 8 pixels at a time with NEON
-        for (; x <= cols - border - 8; x += 8) {
-            // Load 10 pixels from each row (need neighbors)
-            // vld1q_u8 (vector load single-element structures to register)
-            uint8x16_t prev_row = vld1q_u8(prev + x - 1);
-            uint8x16_t curr_row = vld1q_u8(curr + x - 1);
-            uint8x16_t next_row = vld1q_u8(next + x - 1);
-            
-            // Loading the neighbors all 8 pixels
-            int16x8_t prev_left = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(prev_row))); // Load prev row left, turn into u16
-            int16x8_t prev_mid = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(vextq_u8(prev_row, prev_row, 1)))); // Load prev row middle, turn into u16
-            int16x8_t prev_right = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(vextq_u8(prev_row, prev_row, 2)))); // Load prev row right, turn into u16
-            
-            int16x8_t curr_left = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(curr_row))); // load curr row left, turn into u16
-            int16x8_t curr_right = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(vextq_u8(curr_row, curr_row, 2)))); //load prev row right, turn into u16
-            
-            int16x8_t next_left = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(next_row))); // load next row left, turn into u16
-            int16x8_t next_mid = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(vextq_u8(next_row, next_row, 1)))); // load next row middle, turn into u16
-            int16x8_t next_right = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(vextq_u8(next_row, next_row, 2)))); // load next right, turn into u16
-            
-            // Sobel X: [-1 0 1; -2 0 2; -1 0 1]
-            int16x8_t gx = vsubq_s16(prev_right, prev_left); 
-            gx = vaddq_s16(gx, vsubq_s16(vshlq_n_s16(curr_right, 1), vshlq_n_s16(curr_left, 1))); 
-            gx = vaddq_s16(gx, vsubq_s16(next_right, next_left)); 
-            
-            // Sobel Y: [-1 -2 -1; 0 0 0; 1 2 1]
-            int16x8_t gy = vsubq_s16(next_left, prev_left); 
-            gy = vaddq_s16(gy, vsubq_s16(vshlq_n_s16(next_mid, 1), vshlq_n_s16(prev_mid, 1)));
-            gy = vaddq_s16(gy, vsubq_s16(next_right, prev_right));
-            
-            // Convert to float for magnitude calculation
-            float32x4_t gx_low_f = vcvtq_f32_s32(vmovl_s16(vget_low_s16(gx)));
-            float32x4_t gx_high_f = vcvtq_f32_s32(vmovl_s16(vget_high_s16(gx)));
-            float32x4_t gy_low_f = vcvtq_f32_s32(vmovl_s16(vget_low_s16(gy)));
-            float32x4_t gy_high_f = vcvtq_f32_s32(vmovl_s16(vget_high_s16(gy)));
-            
-            // Magnitude: sqrt(gx^2 + gy^2)
-            float32x4_t mag_low = vsqrtq_f32(vaddq_f32(vmulq_f32(gx_low_f, gx_low_f), 
-                                                        vmulq_f32(gy_low_f, gy_low_f)));
-            float32x4_t mag_high = vsqrtq_f32(vaddq_f32(vmulq_f32(gx_high_f, gx_high_f), 
-                                                         vmulq_f32(gy_high_f, gy_high_f)));
-            // Store results
-            vst1q_f32(out + x, mag_low);
-            vst1q_f32(out + x + 4, mag_high);
-        }
-        
-        // Handle remaining pixels
-        for (; x < cols - border; ++x) {
-            float gx =
-                prev[x-1]*X_KERNEL[0] + prev[x]*X_KERNEL[1] + prev[x+1]*X_KERNEL[2] +
-                curr[x-1]*X_KERNEL[3] + curr[x]*X_KERNEL[4] + curr[x+1]*X_KERNEL[5] +
-                next[x-1]*X_KERNEL[6] + next[x]*X_KERNEL[7] + next[x+1]*X_KERNEL[8];
-
-            float gy =
-                prev[x-1]*Y_KERNEL[0] + prev[x]*Y_KERNEL[1] + prev[x+1]*Y_KERNEL[2] +
-                curr[x-1]*Y_KERNEL[3] + curr[x]*Y_KERNEL[4] + curr[x+1]*Y_KERNEL[5] +
-                next[x-1]*Y_KERNEL[6] + next[x]*Y_KERNEL[7] + next[x+1]*Y_KERNEL[8];
-            
-            out[x] = std::sqrt(gx*gx + gy*gy);
+    for(int y = ys; y < ye; ++y){
+        const float* gX_row = gx32f.ptr<float>(y);
+        const float* gY_row = gy32f.ptr<float>(y); 
+        float* out = mag32f.ptr<float>(y); 
+        for (int x = 0; x < cols; ++x) {
+            out[x] = sqrt(gX_row[x] * gX_row[x] + gY_row[x] * gY_row[x]);
         }
     }
 }
 
-/* Can't really reduce cache misses with the grayscale because we aren't reusing any data*/
+static inline __attribute__((noinline)) void convolve3x3_rowptr(const cv::Mat& src, cv::Mat& dst,
+                                      const int16_t kernel[9], int yStart, int yEnd){
+    const int border = 1;
+    const int rows = src.rows, cols = src.cols;
+    const int ys = std::max(border, yStart); // Starting row, max to prevent clipping
+    const int ye = std::min(rows - border, yEnd); // Ending row, min to prevent clipping
+
+    // auto start = high_resolution_clock::now();
+
+    // Load the 3x3 kernel into NEON float32x4_t vectors
+    int16x8_t k0 = vld1q_dup_s16(&kernel[0]); // broadcasted single-element loads
+    int16x8_t k1 = vld1q_dup_s16(&kernel[1]);
+    int16x8_t k2 = vld1q_dup_s16(&kernel[2]);
+    int16x8_t k3 = vld1q_dup_s16(&kernel[3]);
+    int16x8_t k4 = vld1q_dup_s16(&kernel[4]);
+    int16x8_t k5 = vld1q_dup_s16(&kernel[5]);
+    int16x8_t k6 = vld1q_dup_s16(&kernel[6]);
+    int16x8_t k7 = vld1q_dup_s16(&kernel[7]);
+    int16x8_t k8 = vld1q_dup_s16(&kernel[8]);
+
+    for (int y = ys; y < ye; ++y) {
+        const uchar* prev = src.ptr<uchar>(y - 1);
+        const uchar* curr = src.ptr<uchar>(y);
+        const uchar* next = src.ptr<uchar>(y + 1);
+        float* out = dst.ptr<float>(y);
+
+        int x = border;
+        for (; x <= cols - border - 8; x += 8) {
+            // Load 8 uint8 pixels from each row (shifted appropriately)
+            uint8x8_t p0_u8 = vld1_u8(prev + x - 1);
+            uint8x8_t p1_u8 = vld1_u8(prev + x);
+            uint8x8_t p2_u8 = vld1_u8(prev + x + 1);
+
+            uint8x8_t c0_u8 = vld1_u8(curr + x - 1);
+            uint8x8_t c1_u8 = vld1_u8(curr + x);
+            uint8x8_t c2_u8 = vld1_u8(curr + x + 1);
+
+            uint8x8_t n0_u8 = vld1_u8(next + x - 1);
+            uint8x8_t n1_u8 = vld1_u8(next + x);
+            uint8x8_t n2_u8 = vld1_u8(next + x + 1);
+
+            // Widen to signed 16-bit for convolution
+            int16x8_t p0 = vreinterpretq_s16_u16(vmovl_u8(p0_u8));
+            int16x8_t p1 = vreinterpretq_s16_u16(vmovl_u8(p1_u8));
+            int16x8_t p2 = vreinterpretq_s16_u16(vmovl_u8(p2_u8));
+            int16x8_t c0 = vreinterpretq_s16_u16(vmovl_u8(c0_u8));
+            int16x8_t c1 = vreinterpretq_s16_u16(vmovl_u8(c1_u8));
+            int16x8_t c2 = vreinterpretq_s16_u16(vmovl_u8(c2_u8));
+            int16x8_t n0 = vreinterpretq_s16_u16(vmovl_u8(n0_u8));
+            int16x8_t n1 = vreinterpretq_s16_u16(vmovl_u8(n1_u8));
+            int16x8_t n2 = vreinterpretq_s16_u16(vmovl_u8(n2_u8));
+
+
+            // Multiply-accumulate for first 4 pixels
+            // std::cout << "p0: " << curr[x];
+            int16x8_t sum1 = vmulq_s16(p0, k0);
+            sum1 = vmlaq_s16(sum1, p1, k1);
+            sum1 = vmlaq_s16(sum1, p2, k2);
+            sum1 = vmlaq_s16(sum1, c0, k3);
+            sum1 = vmlaq_s16(sum1, c1, k4);
+            sum1 = vmlaq_s16(sum1, c2, k5);
+            sum1 = vmlaq_s16(sum1, n0, k6);
+            sum1 = vmlaq_s16(sum1, n1, k7);
+            sum1 = vmlaq_s16(sum1, n2, k8);
+
+            int32x4_t lo = vmovl_s16(vget_low_s16(sum1));   // lower 4 lanes
+            int32x4_t hi = vmovl_s16(vget_high_s16(sum1));  // upper 4 lanes
+
+            float32x4_t flo = vcvtq_f32_s32(lo);
+            float32x4_t fhi = vcvtq_f32_s32(hi);
+
+            // Store 8 float results (two vectors of 4)
+            vst1q_f32(out + x, flo);
+            vst1q_f32(out + x + 4, fhi);
+        }
+
+        // Remainder pixels (scalar fallback)
+        for (; x < cols - border; ++x) {
+            float sum =
+                prev[x-1]*kernel[0] + prev[x]*kernel[1] + prev[x+1]*kernel[2] +
+                curr[x-1]*kernel[3] + curr[x]*kernel[4] + curr[x+1]*kernel[5] +
+                next[x-1]*kernel[6] + next[x]*kernel[7] + next[x+1]*kernel[8];
+            out[x] = sum;
+        }
+    }
+}
+
 static inline __attribute__((noinline)) void grayscale_calculation(const cv::Mat& bgr, cv::Mat& gray,int yStart, int yEnd){
     const int rows = bgr.rows, cols = bgr.cols;
     const int ys = std::max(0, yStart);
@@ -205,6 +184,7 @@ static inline __attribute__((noinline)) void grayscale_calculation(const cv::Mat
     }
 }
 
+
 void* workerThread(void* arg){
     WorkerContext* ctx = static_cast<WorkerContext*>(arg);
     FrameJob* job = ctx->job;
@@ -222,11 +202,13 @@ void* workerThread(void* arg){
         int yStart = ctx->tid * rowsPerThread;
         int yEnd = std::min(totalRows, yStart + rowsPerThread);
 
-        if (stage == ComputeStages::SOBEL_MAG) {
-            // sobel_calculation_neon(*job->grayFrame, *job->mag32fOut, yStart, yEnd);
-            sobel_calculation(*job->grayFrame, *job->mag32fOut, yStart, yEnd);
+        if (stage == ComputeStages::SOBEL_XY) {
+            convolve3x3_rowptr(*job->grayFrame, *job->sobelXOut, SOBEL_X_KERNEL, yStart, yEnd);
+            convolve3x3_rowptr(*job->grayFrame, *job->sobelYOut, SOBEL_Y_KERNEL, yStart, yEnd);
         } else if (stage == ComputeStages::GRAY_SCALE){
             grayscale_calculation(*job->bgrFrame,*job->grayFrame,yStart, yEnd);
+        } else if (stage == ComputeStages::MAGNITUDE){
+            magnitude(*job->sobelXOut, *job->sobelYOut, *job->mag32fOut ,yStart, yEnd);
         }
 
         // Signal that this thread has finished its slice
@@ -315,7 +297,7 @@ int main(int argc, char** argv){
     cv::namedWindow("Sobel", cv::WINDOW_AUTOSIZE);
 
     //Init for grayscale and sobel
-    cv::Mat frame, gray, mag32f, mag8u; 
+    cv::Mat frame, gray, gX32f, gY32f, mag32f, mag8u; 
 
     while(1){
         if (!cap.read(frame) || frame.empty()) break;
@@ -323,12 +305,18 @@ int main(int argc, char** argv){
         // (Re)allocate outputs on size change
         if (gray.size() != frame.size()) {
             gray.create(frame.size(), CV_8UC1);
+            gX32f.create(frame.size(), CV_32FC1);
+            gY32f.create(frame.size(), CV_32FC1);
             mag32f.create(frame.size(), CV_32FC1);
         }
+        gX32f.setTo(0);
+        gY32f.setTo(0);
     
         // Share current frame info
         job.bgrFrame  = &frame;
         job.grayFrame = &gray;
+        job.sobelXOut = &gX32f;
+        job.sobelYOut = &gY32f;
         job.mag32fOut = &mag32f; 
         job.imgRows   = gray.rows;
         job.imgCols   = gray.cols;
@@ -341,8 +329,13 @@ int main(int argc, char** argv){
         PAPI_stop(EventSet_Grey, values[0]);
 
         // ---- Stage 2: Parallel SOBEL (Both X and Y) ----
-        job.currentStage.store(ComputeStages::SOBEL_MAG, std::memory_order_release);
+        job.currentStage.store(ComputeStages::SOBEL_XY, std::memory_order_release);
         PAPI_start(EventSet_Sobel);
+        pthread_barrier_wait(&job.startBarrier);
+        pthread_barrier_wait(&job.endBarrier);
+    
+        // ---- Stage 3: Parallel Magnitude ----
+        job.currentStage.store(ComputeStages::MAGNITUDE, std::memory_order_release);
         pthread_barrier_wait(&job.startBarrier);
         pthread_barrier_wait(&job.endBarrier);
         PAPI_stop(EventSet_Sobel, values[1]);
@@ -395,8 +388,8 @@ int main(int argc, char** argv){
           << " | L1 Cache Miss: " << avg_sobel_l1dcm
           << " | L2 Cache Miss: " << avg_sobel_l2dcm << "\n";
     
+
     PAPI_shutdown();
 
     return 0;
 }
-

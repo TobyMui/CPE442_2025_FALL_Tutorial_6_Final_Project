@@ -1,10 +1,10 @@
 #!/bin/bash
 
-EXEC="./optimized_final"      # <-- CHANGE IF NEEDED
+EXEC="./sobel_PAPI"      # <-- CHANGE IF NEEDED
 INPUT="romania.mov"           # <-- CHANGE IF NEEDED
 RUNS=5
 
-OUT_FILE="benchmark_results.txt"
+OUT_FILE="baseline_3.9Ghz"
 
 # Accumulators
 total_wall=0
